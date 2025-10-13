@@ -2,7 +2,6 @@ import { createClient } from '@/lib/supabase/server'
 import { redirect } from 'next/navigation'
 import DashboardClient from '@/components/DashboardClient'
 import LogoutButton from '@/components/LogoutButton'
-import Sidebar from '@/components/Sidebar'
 import { Menu } from 'lucide-react'
 
 export default async function DashboardPage() {
