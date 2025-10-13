@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom calendar styles for Freeme */
+.freeme-calendar {
+  font-family: inherit;
+}
+
+.freeme-calendar .rbc-event {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.freeme-calendar .rbc-event:hover {
+  background: linear-gradient(135deg, #5568d3 0%, #653a8c 100%);
+}
+
+.freeme-calendar .rbc-today {
+  background-color: #f0f4ff;
+}
+
+.freeme-calendar .rbc-header {
+  padding: 12px 4px;
+  font-weight: 600;
+  color: #4f46e5;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.freeme-calendar .rbc-toolbar button {
+  color: #4b5563;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.freeme-calendar .rbc-toolbar button:hover {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border-color: transparent;
+}
+
+.freeme-calendar .rbc-toolbar button.rbc-active {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border-color: transparent;
+}
