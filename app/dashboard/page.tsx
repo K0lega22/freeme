@@ -43,11 +43,6 @@ export default async function DashboardPage() {
         <main className="flex-1 p-6 overflow-y-auto">
           <DashboardClient initialEvents={events || []} />
         </main>
-
-        {/* Sidebar - Hidden on mobile, visible on desktop */}
-        <aside className="hidden xl:block">
-          <Sidebar />
-        </aside>
       </div>
     </div>
   )
