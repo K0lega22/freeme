@@ -1,0 +1,26 @@
+# Check status of your files
+git status
+
+# Add specific file
+git add filename.tsx
+
+# Add all files
+git add .
+
+# Commit changes
+git commit -m "Your message here"
+
+# Push to GitHub
+git push
+
+# Pull latest changes from GitHub
+git pull
+
+# View commit history
+git log
+
+# Create a new branch
+git checkout -b feature-name
+
+# Switch branches
+git checkout main

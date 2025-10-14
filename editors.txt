@@ -1,6 +1,0 @@
-middleware.ts - This code is a Next.js middleware that integrates Supabase authentication into your app.
-It runs before your page or API route is served, and decides whether to continue, redirect, or modify cookies.
-
-server.ts - This file defines a small helper function called createClient().
-It creates and returns a Supabase client configured for server-side use in Next.js
-
