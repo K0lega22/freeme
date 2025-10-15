@@ -1,4 +1,4 @@
-// app/api/events/route.ts
+// app/api/events/route.ts - FIXED VERSION
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { checkRateLimit } from '@/lib/validation'
@@ -12,8 +12,8 @@ export async function GET() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Rate limiting: 100 requests per minute
-    const rateLimit = checkRateLimit(user.id, 100, 60000)
+    // Rate limiting: Use the EVENT_API type (100 requests per minute)
+    const rateLimit = checkRateLimit(`user:${user.id}`, 'EVENT_API')
     if (!rateLimit.allowed) {
       return NextResponse.json(
         { error: 'Rate limit exceeded' },
@@ -21,7 +21,9 @@ export async function GET() {
           status: 429,
           headers: {
             'X-RateLimit-Limit': '100',
-            'X-RateLimit-Remaining': '0',
+            'X-RateLimit-Remaining': String(rateLimit.remaining),
+            'X-RateLimit-Reset': new Date(rateLimit.resetTime).toISOString(),
+            'Retry-After': String(rateLimit.retryAfter || 60),
           }
         }
       )
@@ -35,7 +37,15 @@ export async function GET() {
 
     if (error) throw error
 
-    return NextResponse.json({ events: events || [] })
+    return NextResponse.json(
+      { events: events || [] },
+      {
+        headers: {
+          'X-RateLimit-Limit': '100',
+          'X-RateLimit-Remaining': String(rateLimit.remaining),
+        }
+      }
+    )
   } catch (error) {
     console.error('Events API Error:', error)
     return NextResponse.json({ error: 'Failed to fetch events' }, { status: 500 })
