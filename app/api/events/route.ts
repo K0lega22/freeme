@@ -1,5 +1,7 @@
+// app/api/events/route.ts
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
+import { checkRateLimit } from '@/lib/validation'
 
 export async function GET() {
   try {
@@ -8,6 +10,21 @@ export async function GET() {
     
     if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    // Rate limiting: 100 requests per minute
+    const rateLimit = checkRateLimit(user.id, 100, 60000)
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        { error: 'Rate limit exceeded' },
+        { 
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': '100',
+            'X-RateLimit-Remaining': '0',
+          }
+        }
+      )
     }
 
     const { data: events, error } = await supabase

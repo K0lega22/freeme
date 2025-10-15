@@ -1,289 +1,225 @@
+// app/api/ai-event/route.ts
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import OpenAI from 'openai'
+import { sanitizeInput, validateEventData, checkRateLimit } from '@/lib/validation'
 
 const openai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
   baseURL: 'https://openrouter.ai/api/v1',
   defaultHeaders: {
-    'HTTP-Referer': 'https://freeme.app',
+    'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || 'https://freeme.app',
     'X-Title': 'Freeme Calendar',
   },
 })
 
-// Helper function to extract JSON from various formats
 function extractJSON(text: string): any {
   try {
-    // First, try direct parsing
     return JSON.parse(text)
   } catch {
-    try {
-      // Try to extract JSON from markdown code blocks
-      const codeBlockMatch = text.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/)
-      if (codeBlockMatch) {
-        return JSON.parse(codeBlockMatch[1])
-      }
-      
-      // Try to find JSON object in text
-      const jsonMatch = text.match(/\{[\s\S]*\}/)
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0])
-      }
-      
-      throw new Error('No valid JSON found in response')
-    } catch (innerError) {
-      throw new Error('Failed to extract valid JSON from response')
-    }
+    const match = text.match(/\{[\s\S]*\}/)
+    if (match) return JSON.parse(match[0])
+    throw new Error('No valid JSON found')
   }
-}
-
-// Validate parsed response structure
-function validateResponse(response: any): { valid: boolean; error?: string } {
-  if (!response || typeof response !== 'object') {
-    return { valid: false, error: 'Response is not an object' }
-  }
-
-  if (!response.action || !['create', 'update', 'delete'].includes(response.action)) {
-    return { valid: false, error: 'Invalid or missing action' }
-  }
-
-  if (response.action === 'create') {
-    if (!response.event || typeof response.event !== 'object') {
-      return { valid: false, error: 'Missing event object for create action' }
-    }
-    if (!response.event.title || typeof response.event.title !== 'string') {
-      return { valid: false, error: 'Missing or invalid event title' }
-    }
-    if (!response.event.start_time || typeof response.event.start_time !== 'string') {
-      return { valid: false, error: 'Missing or invalid start_time' }
-    }
-    if (!response.event.end_time || typeof response.event.end_time !== 'string') {
-      return { valid: false, error: 'Missing or invalid end_time' }
-    }
-  }
-
-  if (response.action === 'update') {
-    if (!response.event_id || typeof response.event_id !== 'string') {
-      return { valid: false, error: 'Missing or invalid event_id for update' }
-    }
-    if (!response.updates || typeof response.updates !== 'object') {
-      return { valid: false, error: 'Missing updates object for update action' }
-    }
-  }
-
-  if (response.action === 'delete') {
-    if (!response.event_id || typeof response.event_id !== 'string') {
-      return { valid: false, error: 'Missing or invalid event_id for delete' }
-    }
-  }
-
-  return { valid: true }
 }
 
 export async function POST(request: Request) {
   try {
-    const { prompt } = await request.json()
-    
-    if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
-      return NextResponse.json({ error: 'Invalid prompt' }, { status: 400 })
-    }
-    
+    // Authentication
     const supabase = await createClient()
-    const { data: { user } } = await supabase.auth.getUser()
+    const { data: { user }, error: authError } = await supabase.auth.getUser()
     
-    if (!user) {
+    if (authError || !user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
+    // Rate limiting: 10 requests per minute
+    const rateLimit = checkRateLimit(user.id, 10, 60000)
+    if (!rateLimit.allowed) {
+      return NextResponse.json(
+        { error: 'Rate limit exceeded. Please wait before trying again.' },
+        { status: 429 }
+      )
+    }
+
+    // Parse and validate input
+    const body = await request.json()
+    const { prompt } = body
+
+    if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+      return NextResponse.json({ error: 'Invalid prompt' }, { status: 400 })
+    }
+
+    if (prompt.length > 500) {
+      return NextResponse.json({ error: 'Prompt too long (max 500 characters)' }, { status: 400 })
+    }
+
+    // Sanitize input
+    const sanitizedPrompt = sanitizeInput(prompt.trim())
+
+    // Fetch existing events
     const { data: existingEvents } = await supabase
       .from('events')
-      .select('*')
+      .select('id, title, start_time, end_time, location')
       .eq('user_id', user.id)
       .order('start_time', { ascending: true })
+      .limit(50)
 
-    const systemPrompt = `You are Freeme's AI assistant. You MUST respond with ONLY valid JSON, no other text, no markdown, no explanations.
+    const systemPrompt = `You are Freeme's AI assistant. Respond with ONLY valid JSON.
 
-Current date and time: ${new Date().toISOString()}
+Current date: ${new Date().toISOString()}
 
-User's existing events:
+Existing events:
 ${JSON.stringify(existingEvents || [], null, 2)}
 
-CRITICAL: Your response must be ONLY a valid JSON object. Do not include any text before or after the JSON. Do not use markdown code blocks. Do not add explanations.
+Response format:
 
-Response format examples:
-
-For CREATE requests:
+CREATE:
 {
   "action": "create",
   "event": {
-    "title": "Meeting Title",
-    "description": "Optional description",
-    "start_time": "2025-10-15T14:00:00Z",
-    "end_time": "2025-10-15T15:00:00Z",
-    "location": "Optional location"
+    "title": "string",
+    "description": "string or null",
+    "start_time": "ISO 8601 date",
+    "end_time": "ISO 8601 date",
+    "location": "string or null"
   },
-  "message": "I've scheduled your meeting for October 15th at 2:00 PM"
+  "message": "confirmation message"
 }
 
-For UPDATE requests (identify by matching title/time from existing events):
+UPDATE:
 {
   "action": "update",
-  "event_id": "uuid-of-matching-event",
-  "updates": {
-    "title": "New title",
-    "start_time": "2025-10-16T14:00:00Z"
-  },
-  "message": "I've updated your meeting to October 16th"
+  "event_id": "uuid",
+  "updates": { "field": "value" },
+  "message": "confirmation message"
 }
 
-For DELETE requests (identify by matching title/time from existing events):
+DELETE:
 {
   "action": "delete",
-  "event_id": "uuid-of-matching-event",
-  "message": "I've deleted your meeting"
+  "event_id": "uuid",
+  "message": "confirmation message"
 }
 
-Rules:
-- Always use ISO 8601 format for dates (YYYY-MM-DDTHH:mm:ssZ)
-- Default to 1-hour duration if end time not specified
-- Interpret "tomorrow", "next week", "Monday", etc. relative to current time
-- For updates/deletes, find matching event_id from existing events by title or time
-- If ambiguous, choose the most recent or upcoming event
-- Always include a friendly, natural confirmation message
-- For times, assume user's timezone is local unless specified
+RESPOND WITH ONLY THE JSON OBJECT.`
 
-RESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.`
-
+    // Call AI
     const completion = await openai.chat.completions.create({
       model: 'anthropic/claude-4.5-sonnet',
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: prompt }
+        { role: 'user', content: sanitizedPrompt }
       ],
       response_format: { type: 'json_object' },
       temperature: 0.7,
+      max_tokens: 1000,
     })
 
     const responseText = completion.choices[0].message.content || '{}'
-    
-    // Log the raw response for debugging
-    console.log('Raw AI Response:', responseText)
-    
-    // Extract JSON from response
-    let parsedResponse
-    try {
-      parsedResponse = extractJSON(responseText)
-    } catch (parseError) {
-      console.error('JSON Parse Error:', parseError)
-      console.error('Failed Response Text:', responseText)
-      return NextResponse.json({ 
-        error: 'Failed to parse AI response. Please try rephrasing your request.',
-        ...(process.env.NODE_ENV === 'development' && { 
-          debug: { 
-            rawResponse: responseText,
-            error: String(parseError)
-          } 
-        })
-      }, { status: 500 })
-    }
+    const parsedResponse = extractJSON(responseText)
 
     // Validate response structure
-    const validation = validateResponse(parsedResponse)
-    if (!validation.valid) {
-      console.error('Validation Error:', validation.error)
-      console.error('Invalid Response:', parsedResponse)
-      return NextResponse.json({ 
-        error: `AI response validation failed: ${validation.error}`,
-        ...(process.env.NODE_ENV === 'development' && { 
-          debug: { 
-            response: parsedResponse,
-            validationError: validation.error
-          } 
-        })
-      }, { status: 500 })
+    if (!parsedResponse.action || !['create', 'update', 'delete'].includes(parsedResponse.action)) {
+      return NextResponse.json({ error: 'Invalid AI response' }, { status: 500 })
     }
 
-    // Execute CREATE action
+    // Execute CREATE
     if (parsedResponse.action === 'create') {
+      const validation = validateEventData(parsedResponse.event)
+      if (!validation.valid) {
+        return NextResponse.json({ error: validation.error }, { status: 400 })
+      }
+
       const { data, error } = await supabase
         .from('events')
         .insert({
-          title: parsedResponse.event.title,
-          description: parsedResponse.event.description || null,
+          title: sanitizeInput(parsedResponse.event.title).slice(0, 200),
+          description: parsedResponse.event.description 
+            ? sanitizeInput(parsedResponse.event.description).slice(0, 1000) 
+            : null,
           start_time: parsedResponse.event.start_time,
           end_time: parsedResponse.event.end_time,
-          location: parsedResponse.event.location || null,
+          location: parsedResponse.event.location 
+            ? sanitizeInput(parsedResponse.event.location).slice(0, 200) 
+            : null,
           user_id: user.id,
         })
         .select()
+        .single()
 
       if (error) {
-        console.error('Supabase Insert Error:', error)
-        throw error
+        console.error('Insert error:', error.code)
+        return NextResponse.json({ error: 'Failed to create event' }, { status: 500 })
       }
 
-      return NextResponse.json({ 
-        success: true, 
-        event: data[0], 
-        message: parsedResponse.message || 'Event created successfully!' 
+      return NextResponse.json({
+        success: true,
+        event: data,
+        message: sanitizeInput(parsedResponse.message || 'Event created')
       })
     }
 
-    // Execute UPDATE action
+    // Execute UPDATE
     if (parsedResponse.action === 'update') {
-      // First verify the event exists and belongs to the user
-      const { data: existingEvent } = await supabase
+      const { data: existing } = await supabase
         .from('events')
         .select('id')
         .eq('id', parsedResponse.event_id)
         .eq('user_id', user.id)
         .single()
 
-      if (!existingEvent) {
-        return NextResponse.json({ 
-          error: 'Event not found or you do not have permission to update it' 
-        }, { status: 404 })
+      if (!existing) {
+        return NextResponse.json({ error: 'Event not found' }, { status: 404 })
+      }
+
+      const sanitizedUpdates: any = {}
+      if (parsedResponse.updates.title) {
+        sanitizedUpdates.title = sanitizeInput(parsedResponse.updates.title).slice(0, 200)
+      }
+      if (parsedResponse.updates.description) {
+        sanitizedUpdates.description = sanitizeInput(parsedResponse.updates.description).slice(0, 1000)
+      }
+      if (parsedResponse.updates.location) {
+        sanitizedUpdates.location = sanitizeInput(parsedResponse.updates.location).slice(0, 200)
+      }
+      if (parsedResponse.updates.start_time) {
+        sanitizedUpdates.start_time = parsedResponse.updates.start_time
+      }
+      if (parsedResponse.updates.end_time) {
+        sanitizedUpdates.end_time = parsedResponse.updates.end_time
       }
 
       const { data, error } = await supabase
         .from('events')
-        .update(parsedResponse.updates)
+        .update(sanitizedUpdates)
         .eq('id', parsedResponse.event_id)
         .eq('user_id', user.id)
         .select()
+        .single()
 
       if (error) {
-        console.error('Supabase Update Error:', error)
-        throw error
+        return NextResponse.json({ error: 'Failed to update event' }, { status: 500 })
       }
 
-      if (!data || data.length === 0) {
-        return NextResponse.json({ 
-          error: 'Failed to update event' 
-        }, { status: 500 })
-      }
-
-      return NextResponse.json({ 
-        success: true, 
-        event: data[0], 
-        message: parsedResponse.message || 'Event updated successfully!' 
+      return NextResponse.json({
+        success: true,
+        event: data,
+        message: sanitizeInput(parsedResponse.message || 'Event updated')
       })
     }
 
-    // Execute DELETE action
+    // Execute DELETE
     if (parsedResponse.action === 'delete') {
-      // First verify the event exists and belongs to the user
-      const { data: existingEvent } = await supabase
+      const { data: existing } = await supabase
         .from('events')
-        .select('id, title')
+        .select('id')
         .eq('id', parsedResponse.event_id)
         .eq('user_id', user.id)
         .single()
 
-      if (!existingEvent) {
-        return NextResponse.json({ 
-          error: 'Event not found or you do not have permission to delete it' 
-        }, { status: 404 })
+      if (!existing) {
+        return NextResponse.json({ error: 'Event not found' }, { status: 404 })
       }
 
       const { error } = await supabase
@@ -293,28 +229,22 @@ RESPOND WITH ONLY THE JSON OBJECT. NO OTHER TEXT.`
         .eq('user_id', user.id)
 
       if (error) {
-        console.error('Supabase Delete Error:', error)
-        throw error
+        return NextResponse.json({ error: 'Failed to delete event' }, { status: 500 })
       }
 
-      return NextResponse.json({ 
-        success: true, 
-        message: parsedResponse.message || 'Event deleted successfully!' 
+      return NextResponse.json({
+        success: true,
+        message: sanitizeInput(parsedResponse.message || 'Event deleted')
       })
     }
 
-    // This shouldn't happen due to validation, but just in case
-    return NextResponse.json({ 
-      error: 'Unknown action type' 
-    }, { status: 400 })
+    return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
 
   } catch (error) {
-    console.error('AI API Error:', error)
-    return NextResponse.json({ 
-      error: 'Failed to process request. Please try again.',
-      ...(process.env.NODE_ENV === 'development' && { 
-        details: String(error) 
-      })
-    }, { status: 500 })
+    console.error('AI API Error:', error instanceof Error ? error.message : 'Unknown')
+    return NextResponse.json(
+      { error: 'Failed to process request' },
+      { status: 500 }
+    )
   }
 }
