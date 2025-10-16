@@ -1,4 +1,4 @@
-// app/api/ai-event/route.ts - ENHANCED SECURE VERSION
+// app/api/ai-event/route.ts - FIXED VERSION
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import OpenAI from 'openai'
@@ -22,11 +22,11 @@ function getOpenAIClient() {
     apiKey,
     baseURL: 'https://openrouter.ai/api/v1',
     defaultHeaders: {
-      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || 'https://freeme.app',
+      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000',
       'X-Title': 'Freeme Calendar',
     },
-    timeout: 30000, // 30 second timeout
-    maxRetries: 2,
+    timeout: 45000, // Increased to 45 seconds
+    maxRetries: 1, // Reduced retries
   })
 }
 
@@ -42,24 +42,28 @@ const ERROR_RESPONSES = {
   SERVER_ERROR: { error: 'Internal server error', code: 'SERVER_ERROR' },
 } as const
 
+// Improved JSON extraction
 function extractJSON(text: string): any {
+  console.log('AI Response:', text.slice(0, 500)) // Debug log
+  
   try {
-    // Try direct parse first
-    return JSON.parse(text)
-  } catch {
-    // Try to extract JSON from markdown code blocks
-    const codeBlockMatch = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/)
-    if (codeBlockMatch) {
-      return JSON.parse(codeBlockMatch[1])
-    }
+    // Remove any markdown formatting
+    let cleaned = text.trim()
     
-    // Try to find JSON object in text
-    const jsonMatch = text.match(/\{[\s\S]*\}/)
+    // Remove markdown code blocks
+    cleaned = cleaned.replace(/```json\s*/g, '').replace(/```\s*/g, '')
+    
+    // Try to find JSON object
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/)
     if (jsonMatch) {
       return JSON.parse(jsonMatch[0])
     }
     
-    throw new Error('No valid JSON found in response')
+    // Try direct parse
+    return JSON.parse(cleaned)
+  } catch (error) {
+    console.error('JSON Parse Error:', error)
+    throw new Error(`Failed to parse AI response: ${text.slice(0, 100)}`)
   }
 }
 
@@ -68,11 +72,14 @@ export async function POST(request: Request) {
   const startTime = Date.now()
 
   try {
+    console.log(`[${requestId}] AI Event Request Started`)
+
     // 1. Validate request size
     const contentLength = request.headers.get('content-length')
-    const sizeCheck = validateRequestSize(contentLength, 10240) // 10KB max
+    const sizeCheck = validateRequestSize(contentLength, 10240)
     
     if (!sizeCheck.valid) {
+      console.log(`[${requestId}] Request too large`)
       return NextResponse.json(
         ERROR_RESPONSES.PAYLOAD_TOO_LARGE,
         { status: 413 }
@@ -84,15 +91,19 @@ export async function POST(request: Request) {
     const { data: { user }, error: authError } = await supabase.auth.getUser()
     
     if (authError || !user) {
+      console.log(`[${requestId}] Auth failed:`, authError?.message)
       return NextResponse.json(
         ERROR_RESPONSES.UNAUTHORIZED,
         { status: 401 }
       )
     }
 
-    // 3. Rate limiting (per user)
+    console.log(`[${requestId}] User authenticated:`, user.id)
+
+    // 3. Rate limiting
     const rateLimit = checkRateLimit(`user:${user.id}`, 'AI_REQUEST')
     if (!rateLimit.allowed) {
+      console.log(`[${requestId}] Rate limit exceeded`)
       return NextResponse.json(
         {
           ...ERROR_RESPONSES.RATE_LIMIT,
@@ -110,11 +121,12 @@ export async function POST(request: Request) {
       )
     }
 
-    // 4. Parse and validate request body
+    // 4. Parse request body
     let body: any
     try {
       body = await request.json()
     } catch {
+      console.log(`[${requestId}] Invalid JSON body`)
       return NextResponse.json(
         { ...ERROR_RESPONSES.INVALID_INPUT, details: 'Invalid JSON' },
         { status: 400 }
@@ -123,9 +135,10 @@ export async function POST(request: Request) {
 
     const { prompt } = body
 
-    // 5. Validate AI prompt
+    // 5. Validate prompt
     const promptValidation = validateAIPrompt(prompt)
     if (!promptValidation.valid) {
+      console.log(`[${requestId}] Invalid prompt:`, promptValidation.error)
       return NextResponse.json(
         { ...ERROR_RESPONSES.INVALID_INPUT, details: promptValidation.error },
         { status: 400 }
@@ -133,141 +146,165 @@ export async function POST(request: Request) {
     }
 
     const sanitizedPrompt = promptValidation.sanitized!
+    console.log(`[${requestId}] Processing prompt:`, sanitizedPrompt.slice(0, 50))
 
-    // 6. Fetch existing events (with limit)
+    // 6. Fetch existing events
     const { data: existingEvents, error: fetchError } = await supabase
       .from('events')
-      .select('id, title, start_time, end_time, location')
+      .select('id, title, start_time, end_time, location, description')
       .eq('user_id', user.id)
-      .gte('end_time', new Date().toISOString()) // Only future/current events
+      .gte('end_time', new Date().toISOString())
       .order('start_time', { ascending: true })
       .limit(50)
 
     if (fetchError) {
-      console.error(`[${requestId}] Database fetch error:`, fetchError.code)
+      console.error(`[${requestId}] Database fetch error:`, fetchError)
       return NextResponse.json(
         ERROR_RESPONSES.DATABASE_ERROR,
         { status: 500 }
       )
     }
 
+    console.log(`[${requestId}] Loaded ${existingEvents?.length || 0} existing events`)
+
     // 7. Prepare AI system prompt
     const now = new Date()
-    const systemPrompt = `You are Freeme's AI calendar assistant. Analyze the user's request and respond with ONLY valid JSON.
+    const systemPrompt = `You are Freeme's AI calendar assistant. Current time: ${now.toISOString()}
 
-CRITICAL RULES:
-- Current datetime: ${now.toISOString()}
-- User timezone: UTC (adjust times accordingly)
-- ONLY return valid JSON, no markdown, no explanations
-- Use ISO 8601 format for all dates
-- Validate that end_time is after start_time
-
-AVAILABLE ACTIONS:
-1. CREATE - Create new event
-2. UPDATE - Modify existing event
-3. DELETE - Remove event
-4. QUERY - Find/list events (return { "action": "query", "results": [...], "message": "..." })
-
-EXISTING EVENTS (next 50):
+USER'S EXISTING EVENTS:
 ${JSON.stringify(existingEvents || [], null, 2)}
+
+INSTRUCTIONS:
+- Analyze the user's request and determine the appropriate action
+- Respond with ONLY a JSON object, no markdown, no explanation
+- Use ISO 8601 format for dates (YYYY-MM-DDTHH:mm:ss.sssZ)
+- Ensure end_time is after start_time
+- When the user doesn't specify a time, use reasonable defaults (e.g., 9am for meetings)
+
+ACTIONS:
+1. CREATE - Create a new event
+2. UPDATE - Modify an existing event (requires event_id)
+3. DELETE - Remove an event (requires event_id)
+4. QUERY - Search/list events
 
 RESPONSE FORMATS:
 
-CREATE:
+For CREATE:
 {
   "action": "create",
   "event": {
-    "title": "Meeting Title",
+    "title": "Event Title",
     "description": "Optional description",
-    "start_time": "2025-10-20T10:00:00Z",
-    "end_time": "2025-10-20T11:00:00Z",
-    "location": "Office or null"
+    "start_time": "2025-10-20T09:00:00.000Z",
+    "end_time": "2025-10-20T10:00:00.000Z",
+    "location": "Location or null"
   },
-  "message": "Created meeting for tomorrow at 10am"
+  "message": "Created meeting for tomorrow at 9am"
 }
 
-UPDATE:
+For UPDATE:
 {
   "action": "update",
-  "event_id": "uuid-here",
-  "updates": { "start_time": "2025-10-21T10:00:00Z" },
-  "message": "Moved meeting to next day"
+  "event_id": "existing-event-uuid",
+  "updates": {
+    "start_time": "2025-10-21T09:00:00.000Z",
+    "title": "New Title"
+  },
+  "message": "Updated meeting time"
 }
 
-DELETE:
+For DELETE:
 {
   "action": "delete",
-  "event_id": "uuid-here",
-  "message": "Deleted meeting"
+  "event_id": "existing-event-uuid",
+  "message": "Deleted the meeting"
 }
 
-QUERY:
+For QUERY:
 {
   "action": "query",
-  "results": [{ "id": "...", "title": "..." }],
+  "results": [{"id": "uuid", "title": "Meeting", "start_time": "..."}],
   "message": "Found 2 meetings tomorrow"
 }
 
-RETURN ONLY THE JSON OBJECT.`
+IMPORTANT: Return ONLY the JSON object, nothing else.`
 
-    // 8. Call AI with timeout
+    // 8. Call AI with improved error handling
     let completion: any
     try {
       const openai = getOpenAIClient()
       
-      completion = await Promise.race([
-        openai.chat.completions.create({
-          model: 'anthropic/claude-sonnet-4-20250514',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: sanitizedPrompt }
-          ],
-          response_format: { type: 'json_object' },
-          temperature: 0.3,
-          max_tokens: 1000,
-        }),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('AI request timeout')), 25000)
-        )
-      ])
+      console.log(`[${requestId}] Calling AI API...`)
+      
+      // Use correct model name for OpenRouter + Claude
+      completion = await openai.chat.completions.create({
+        model: 'anthropic/claude-3.5-sonnet', // Correct model string
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: sanitizedPrompt }
+        ],
+        temperature: 0.3,
+        max_tokens: 1500,
+        // Don't use response_format for Claude - it's not reliable
+      })
+
+      console.log(`[${requestId}] AI API responded`)
+      
     } catch (aiError: any) {
-      console.error(`[${requestId}] AI API error:`, aiError.message)
+      console.error(`[${requestId}] AI API error:`, {
+        message: aiError.message,
+        status: aiError.status,
+        type: aiError.type,
+      })
       
       return NextResponse.json(
         { 
           ...ERROR_RESPONSES.AI_ERROR,
-          details: process.env.NODE_ENV === 'development' ? aiError.message : undefined
+          details: aiError.message,
+          message: 'Could not process your request. Please try again.'
         },
         { status: 503 }
       )
     }
 
     // 9. Parse AI response
-    const responseText = completion.choices[0].message.content || '{}'
+    const responseText = completion.choices[0]?.message?.content || '{}'
+    console.log(`[${requestId}] AI Response:`, responseText.slice(0, 200))
+    
     let parsedResponse: any
 
     try {
       parsedResponse = extractJSON(responseText)
-    } catch (parseError) {
-      console.error(`[${requestId}] JSON parse error:`, responseText.slice(0, 200))
+      console.log(`[${requestId}] Parsed action:`, parsedResponse.action)
+    } catch (parseError: any) {
+      console.error(`[${requestId}] JSON parse failed:`, parseError.message)
       return NextResponse.json(
-        { ...ERROR_RESPONSES.AI_ERROR, details: 'Invalid AI response format' },
+        { 
+          ...ERROR_RESPONSES.AI_ERROR, 
+          details: 'Could not understand AI response',
+          message: 'Sorry, I had trouble processing that. Please try rephrasing.'
+        },
         { status: 500 }
       )
     }
 
-    // 10. Validate response structure
+    // 10. Validate action
     const validActions = ['create', 'update', 'delete', 'query']
     if (!parsedResponse.action || !validActions.includes(parsedResponse.action)) {
       console.error(`[${requestId}] Invalid action:`, parsedResponse.action)
       return NextResponse.json(
-        { ...ERROR_RESPONSES.AI_ERROR, details: 'Invalid action type' },
+        { 
+          ...ERROR_RESPONSES.AI_ERROR, 
+          details: 'Invalid action type',
+          message: 'Sorry, I couldn\'t understand what you wanted to do.'
+        },
         { status: 500 }
       )
     }
 
-    // 11. Execute QUERY action
+    // 11. Handle QUERY action
     if (parsedResponse.action === 'query') {
+      console.log(`[${requestId}] Query action completed`)
       return NextResponse.json({
         success: true,
         action: 'query',
@@ -278,22 +315,24 @@ RETURN ONLY THE JSON OBJECT.`
       })
     }
 
-    // 12. Execute CREATE action
+    // 12. Handle CREATE action
     if (parsedResponse.action === 'create') {
-      // Validate event data with Zod
       const validation = eventSchema.safeParse(parsedResponse.event)
       
       if (!validation.success) {
+        console.error(`[${requestId}] Event validation failed:`, validation.error)
         return NextResponse.json(
           { 
             ...ERROR_RESPONSES.INVALID_INPUT,
-            details: validation.error.issues[0].message 
+            details: validation.error.issues[0].message,
+            message: 'Invalid event details. Please check your request.'
           },
           { status: 400 }
         )
       }
 
       const eventData = validation.data
+      console.log(`[${requestId}] Creating event:`, eventData.title)
 
       const { data, error } = await supabase
         .from('events')
@@ -305,13 +344,17 @@ RETURN ONLY THE JSON OBJECT.`
         .single()
 
       if (error) {
-        console.error(`[${requestId}] Insert error:`, error.code)
+        console.error(`[${requestId}] Insert error:`, error)
         return NextResponse.json(
-          ERROR_RESPONSES.DATABASE_ERROR,
+          { 
+            ...ERROR_RESPONSES.DATABASE_ERROR,
+            message: 'Failed to create event. Please try again.'
+          },
           { status: 500 }
         )
       }
 
+      console.log(`[${requestId}] Event created successfully:`, data.id)
       return NextResponse.json({
         success: true,
         action: 'create',
@@ -322,12 +365,12 @@ RETURN ONLY THE JSON OBJECT.`
       })
     }
 
-    // 13. Execute UPDATE action
+    // 13. Handle UPDATE action
     if (parsedResponse.action === 'update') {
       const { event_id, updates } = parsedResponse
 
-      // Validate event_id
       if (!isValidUUID(event_id)) {
+        console.log(`[${requestId}] Invalid event ID for update`)
         return NextResponse.json(
           { ...ERROR_RESPONSES.INVALID_INPUT, details: 'Invalid event ID' },
           { status: 400 }
@@ -343,21 +386,14 @@ RETURN ONLY THE JSON OBJECT.`
         .single()
 
       if (checkError || !existing) {
+        console.log(`[${requestId}] Event not found for update`)
         return NextResponse.json(
-          ERROR_RESPONSES.NOT_FOUND,
+          { ...ERROR_RESPONSES.NOT_FOUND, message: 'Event not found' },
           { status: 404 }
         )
       }
 
-      // Validate updates
-      if (!updates || typeof updates !== 'object') {
-        return NextResponse.json(
-          { ...ERROR_RESPONSES.INVALID_INPUT, details: 'Invalid updates' },
-          { status: 400 }
-        )
-      }
-
-      // Sanitize and validate each update field
+      // Sanitize updates
       const allowedFields = ['title', 'description', 'start_time', 'end_time', 'location']
       const sanitizedUpdates: any = {}
 
@@ -372,12 +408,7 @@ RETURN ONLY THE JSON OBJECT.`
           sanitizedUpdates.location = value ? String(value).trim().slice(0, 200) : null
         } else if ((key === 'start_time' || key === 'end_time') && typeof value === 'string') {
           const dateCheck = new Date(value)
-          if (isNaN(dateCheck.getTime())) {
-            return NextResponse.json(
-              { ...ERROR_RESPONSES.INVALID_INPUT, details: `Invalid ${key}` },
-              { status: 400 }
-            )
-          }
+          if (isNaN(dateCheck.getTime())) continue
           sanitizedUpdates[key] = value
         }
       }
@@ -389,6 +420,8 @@ RETURN ONLY THE JSON OBJECT.`
         )
       }
 
+      console.log(`[${requestId}] Updating event:`, event_id)
+
       const { data, error } = await supabase
         .from('events')
         .update(sanitizedUpdates)
@@ -398,13 +431,14 @@ RETURN ONLY THE JSON OBJECT.`
         .single()
 
       if (error) {
-        console.error(`[${requestId}] Update error:`, error.code)
+        console.error(`[${requestId}] Update error:`, error)
         return NextResponse.json(
-          ERROR_RESPONSES.DATABASE_ERROR,
+          { ...ERROR_RESPONSES.DATABASE_ERROR, message: 'Failed to update event' },
           { status: 500 }
         )
       }
 
+      console.log(`[${requestId}] Event updated successfully`)
       return NextResponse.json({
         success: true,
         action: 'update',
@@ -415,11 +449,10 @@ RETURN ONLY THE JSON OBJECT.`
       })
     }
 
-    // 14. Execute DELETE action
+    // 14. Handle DELETE action
     if (parsedResponse.action === 'delete') {
       const { event_id } = parsedResponse
 
-      // Validate event_id
       if (!isValidUUID(event_id)) {
         return NextResponse.json(
           { ...ERROR_RESPONSES.INVALID_INPUT, details: 'Invalid event ID' },
@@ -427,7 +460,7 @@ RETURN ONLY THE JSON OBJECT.`
         )
       }
 
-      // Verify ownership before deletion
+      // Verify ownership
       const { data: existing, error: checkError } = await supabase
         .from('events')
         .select('id, title')
@@ -437,10 +470,12 @@ RETURN ONLY THE JSON OBJECT.`
 
       if (checkError || !existing) {
         return NextResponse.json(
-          ERROR_RESPONSES.NOT_FOUND,
+          { ...ERROR_RESPONSES.NOT_FOUND, message: 'Event not found' },
           { status: 404 }
         )
       }
+
+      console.log(`[${requestId}] Deleting event:`, event_id)
 
       const { error } = await supabase
         .from('events')
@@ -449,13 +484,14 @@ RETURN ONLY THE JSON OBJECT.`
         .eq('user_id', user.id)
 
       if (error) {
-        console.error(`[${requestId}] Delete error:`, error.code)
+        console.error(`[${requestId}] Delete error:`, error)
         return NextResponse.json(
-          ERROR_RESPONSES.DATABASE_ERROR,
+          { ...ERROR_RESPONSES.DATABASE_ERROR, message: 'Failed to delete event' },
           { status: 500 }
         )
       }
 
+      console.log(`[${requestId}] Event deleted successfully`)
       return NextResponse.json({
         success: true,
         action: 'delete',
@@ -466,20 +502,24 @@ RETURN ONLY THE JSON OBJECT.`
       })
     }
 
-    // Fallback (should never reach here)
+    // Should never reach here
     return NextResponse.json(
       ERROR_RESPONSES.SERVER_ERROR,
       { status: 500 }
     )
 
   } catch (error: any) {
-    console.error(`[${requestId}] Unhandled error:`, error.message)
+    console.error(`[${requestId}] Unhandled error:`, {
+      message: error.message,
+      stack: error.stack?.slice(0, 500),
+    })
     
     return NextResponse.json(
       {
         ...ERROR_RESPONSES.SERVER_ERROR,
         requestId,
-        details: process.env.NODE_ENV === 'development' ? error.message : undefined,
+        details: error.message,
+        message: 'Something went wrong. Please try again.'
       },
       { status: 500 }
     )
@@ -492,5 +532,6 @@ export async function GET() {
     status: 'ok',
     service: 'ai-event',
     timestamp: new Date().toISOString(),
+    version: '2.0',
   })
 }
